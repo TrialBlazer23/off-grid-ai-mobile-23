@@ -1,8 +1,79 @@
-# Project Instructions
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+Off Grid AI: a React Native 0.83 app (iOS + Android) that runs AI fully on-device — GGUF text/vision chat via llama.rn (plus Google AI Edge LiteRT on Android), Stable Diffusion image generation, Whisper STT, RAG, tool calling/MCP, and remote OpenAI-compatible servers. The free core is MIT; paid Pro features live in the `pro/` submodule.
+
+## Commands
+
+```sh
+npm start                                   # Metro
+npm run ios                                 # iOS simulator
+npm run ios:device                          # physical iPhone via manual signing (env: IOS_DEVICE_ID, IOS_PROFILE, IOS_TEAM)
+npm run android                             # Android debug build (appId ai.offgridmobile.dev)
+
+npx tsc --noEmit                            # typecheck
+npx eslint .                                # JS/TS lint (npm run lint adds gradle lintDebug + swiftlint)
+
+npx jest                                    # all JS tests (npm test adds --coverage AND the native android+ios suites)
+npx jest __tests__/unit/utils/foo.test.ts   # single test file
+npx jest path/to/file.test.tsx -t "name"    # single test by name
+npm run test:android                        # gradle :app:testDebugUnitTest
+npm run test:ios                            # xcodebuild test, iPhone 16e simulator
+npm run test:e2e                            # Maestro flows in .maestro/flows/p0 (needs booted sim/emulator with the app installed)
+maestro test .maestro/flows/p0/02-text-generation.yaml    # single e2e flow
+```
+
+- Jest coverage threshold is 80% global (also Codecov's project/patch target), enforced only when `--coverage` is passed — single-file runs won't trip it. `DEBUG_JEST_CONSOLE=1` un-suppresses console output in tests.
+- `npm install` runs `patch-package`; `patches/` carries required native fixes (whisper.rn crash guards, background-downloader threading, zip-archive, etc.).
+- Dead-code check: `npx knip`. Release pipeline: `scripts/release.sh`.
 
 ## Repository Layout
 
 **All Pro feature code lives in the `pro/` submodule (its own git repo, `@offgrid/pro`) — not in core.** When changing or adding a Pro feature (e.g. TTS/audio, MCP/tools, and other paid surfaces), edit files under `pro/` and commit/PR them in that repo. Core only wires Pro in through the slot/hook registries; it never imports Pro code directly. Pro changes are a separate branch + PR from core (see `pro/CLAUDE.md`).
+
+## Architecture Overview
+
+Depth lives in `docs/ARCHITECTURE.md`; subsystem designs in `docs/design/` (`MODEL_DOWNLOAD_SERVICE.md`, `MODEL_ROUTING.md`, `AUDIO_PLAYBACK_SERVICE.md`) and `docs/standards/CODEBASE_GUIDE.md`.
+
+### Service → store → view (the one pattern everything follows)
+
+A plain-TS singleton service owns each subsystem's state machine, resources, and side effects; a zustand store (`src/stores/`) is a read-only projection for rendering; views/hooks dispatch intents to the service. Each machine logs `[*-SM]` transition traces (see Device Logs below):
+
+| Tag | Owner | Owns |
+|---|---|---|
+| `[MODEL-SM]` | `src/services/activeModelService/` | the ONLY place models load/unload (text + image), engine-aware |
+| `[MEM-SM]` | `src/services/modelResidency/` | RAM budget, eviction, the global FIFO `runExclusive` load lock, memory-warning response |
+| `[DL-SM]` | `src/services/modelDownloadService/` | ALL downloads (text/image/stt/tts) via per-domain `DownloadProvider`s; UI is gated by `DownloadCapabilities` flags (`modelDownloadService/types.ts`) |
+| `[GEN-SM]` | `src/services/generationSession.ts` | which conversation is generating (the streaming engine itself is `generationService.ts` + `generationToolLoop.ts`) |
+| `[IMG-SM]` | `src/services/imageGenerationService.ts` | image-gen phase machine (`idle→enhancing→loading→generating→saving→…`); `phase` is the only stored truth |
+| `[ROUTE-SM]` | `src/services/intentClassifier.ts` | image-vs-text intent (cache → regex → optional LLM via the auto-provisioned SmolLM2 classifier, `classifierProvisioning.ts`) |
+| `[FAIL-SM]` | `src/services/modelFailureHandler.ts` | turns any model failure into the one dismissible card (`modelFailureStore`) |
+| `[TTS-SM]` | `src/services/audioSessionManager.ts` | iOS AVAudioSession category/activation (TTS engines themselves live in Pro) |
+
+### Inference engines
+- Text/vision: llama.rn (GGUF) wrapped by `src/services/llm.ts`; Android-only LiteRT in `src/services/litert.ts`. `src/services/engines.ts` (`getActiveEngineService()`) dispatches the operations both engines support.
+- Image: `src/services/localDreamGenerator.ts` bridges via `Platform.select` to `CoreMLDiffusionModule` (iOS, Core ML/ANE) or `LocalDreamModule` (Android, MNN CPU / QNN NPU); orchestrated by `imageGenerationService.ts`.
+- STT: whisper.rn (`src/services/whisperService.ts`). Remote OpenAI-compatible servers: `remoteServerManager.ts` + `src/services/providers/`. RAG: `src/services/rag/` — the only op-sqlite consumer (`rag.db`).
+- Model discovery: HuggingFace API + curated catalog — `src/services/modelManager/`, `src/constants/models.ts`.
+
+### Native modules (classic bridge, not codegen TurboModules)
+TS contracts are declared inline in the consuming service (`NativeModules.X` + interfaces; shared payload types in e.g. `src/services/backgroundDownloadTypes.ts`). Cross-platform modules keep identical JS names/methods on both sides: `DownloadManagerModule` (iOS URLSession — `ios/DownloadManagerModule.swift`; Android WorkManager + Room — `android/app/src/main/java/ai/offgridmobile/download/`), `DeviceMemoryModule`, `PDFExtractorModule`. Platform-specific backends (`CoreMLDiffusionModule` / `LocalDreamModule`) are reconciled inside ONE JS service; `LiteRTModule` is Android-only. Android modules register in `MainApplication.kt`.
+
+### Pro wiring (core never imports Pro)
+`metro.config.js` aliases `@offgrid/pro` to the `pro/` submodule only if `pro/package.json` exists, else to the null stub `src/bootstrap/proStub.js`; `jest.config.js` mirrors this and skips pro-dependent suites (audio/engine/TTS/MCP) when the submodule is absent. `src/bootstrap/loadProFeatures.ts` requires the package, checks the entitlement, and calls `pro.activate({...registration callbacks})`. The seams: `src/bootstrap/slotRegistry.ts` (UI slots), `src/bootstrap/hookRegistry.ts` (behavior hooks, e.g. `audio.speak`), `src/navigation/screenRegistry.ts` (Pro screens — the `McpServers` screen's presence is the app-wide "Pro is active" signal, see `useIsProActive`), `src/components/settings/sectionRegistry.ts`, and `src/services/tools/extensions.ts` (tool extensions over the built-ins in `tools/registry.ts`). Licensing is Keygen license keys cached in the Keychain (`proLicenseService.ts`, `keygenClient.ts`); the RevenueCat SDK is never called in core — purchase happens on the web.
+
+### Persistence
+Chats/conversations use zustand `persist` → AsyncStorage (`chatStore.ts`), as do the app/project/remote-server/whisper/auth stores. op-sqlite is ONLY for RAG. In-flight downloads live natively (Room DB on Android, URLSession state on iOS) and are rehydrated into the non-persisted `downloadStore` at launch.
+
+### App init order (`App.tsx` `initializeApp`) — order matters
+appStore hydration → download-store hydration from native → reattach download recovery → register core download providers → model manager init + list refresh → remote-server store hydration before provider init → auth/RAG → `checkProStatus()` → `loadProFeatures()`. Models are intentionally NOT loaded at boot; they load lazily on first use.
+
+### UI
+Root native stack wrapping a 5-tab bottom-tab navigator, all in `src/navigation/AppNavigator.tsx`. Design tokens are split across two places: COLORS/SHADOWS come from `useTheme()`/`useThemedStyles()` in `src/theme/` (palettes in `src/theme/palettes.ts`); TYPOGRAPHY/SPACING/FONTS come from `src/constants/index.ts`.
+
+### Tests
+Centralized under `__tests__/` (not colocated with src): `unit/` and `integration/` mirror `src/`, plus `rntl/` (render tests), `contracts/` (native-module contract tests), `hardening/` (regression batches). Module aliases `@/*` and `@offgrid/core/*` → `src/*`.
 
 ## Device Logs (how to see what's actually happening on the device)
 
@@ -107,21 +178,23 @@ If the answer to 1 is "no", say so and write the simple version. If "yes", build
 - **Contract tests run against the abstraction, so they catch both platforms.** Test the common interface + the capability flags; a single test then guards iOS and Android together. If a test can only be written per-platform, the abstraction is wrong.
 - **Native module contract parity is mandatory.** The Swift and Kotlin implementations of a module must expose the SAME method names, the SAME events (names + payloads), and the SAME semantics (persistence, cleanup, error cascading). Contract drift between Swift and Kotlin is the root cause of platform-only bugs — when you touch a native module on one platform, verify/mirror the other side against the shared TS contract.
 
-## Pre-Commit Quality Gates
+## Pre-Push Quality Gates
 
-All quality gates run automatically via Husky on every `git commit`, scoped to the file types you staged:
+Quality gates run automatically via Husky on `git push` (`.husky/pre-push` — there is no pre-commit hook), scoped to the file types changed in the push range:
 
-| Staged file type | Checks that run automatically |
+| Changed file type | Checks that run automatically |
 |---|---|
-| `.ts` / `.tsx` / `.js` / `.jsx` | eslint (staged only), `tsc --noEmit`, `npm test` |
-| `.swift` | swiftlint (staged only), `npm run test:ios` |
+| `.ts` / `.tsx` / `.js` / `.jsx` | eslint (changed files only), `tsc --noEmit`, `npx jest --findRelatedTests` |
+| `.swift` | swiftlint (changed files only), `npm run test:ios` |
 | `.kt` / `.kts` | `compileDebugKotlin` (type check), `lintDebug`, `npm run test:android` |
+
+If anything changed at all, `npm run sonar` also runs (it skips itself when `SONAR_TOKEN` is unset).
 
 **Requirements:**
 - SwiftLint: `brew install swiftlint` (skipped with a warning if not installed)
 - Android checks require the Gradle wrapper in `android/`
 
-Before writing new code, ensure tests exist for your changes. If the hook fails, fix the issue and recommit — never skip with `--no-verify`.
+Before writing new code, ensure tests exist for your changes. If the hook fails, fix the issue and push again — never skip with `--no-verify`.
 
 ## Testing Requirements
 
